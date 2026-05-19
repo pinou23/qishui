@@ -91,6 +91,7 @@ h1 {
 
 .top-actions,
 .sort-group,
+.pane-title,
 .field-row,
 .segment-row,
 .copy-row,
@@ -363,6 +364,10 @@ textarea:focus {
   gap: 12px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--line);
+}
+
+.pane-title {
+  min-width: 0;
 }
 
 .track-table {

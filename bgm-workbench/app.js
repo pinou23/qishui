@@ -4,6 +4,7 @@ const state = {
   sort: "priority",
   dirty: false,
   serverMode: true,
+  syncing: false,
   player: {
     trackId: "",
     audioUrl: "",
@@ -30,6 +31,7 @@ const els = {
   favoriteFilter: document.querySelector("#favoriteFilter"),
   tagFilters: document.querySelector("#tagFilters"),
   resultCount: document.querySelector("#resultCount"),
+  syncLibraryButton: document.querySelector("#syncLibraryButton"),
   trackList: document.querySelector("#trackList"),
   detailPane: document.querySelector("#detailPane"),
   saveButton: document.querySelector("#saveButton"),
@@ -149,6 +151,33 @@ async function writeClipboard(text) {
 function setDirty(value) {
   state.dirty = value;
   els.saveButton.textContent = value ? "保存*" : "保存";
+}
+
+function formatDateTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function updateLibraryMeta(library) {
+  const parts = [`${library.count || 0} 首`];
+  if (library.synced_from_soda_at) {
+    parts.push(`汽水同步 ${formatDateTime(library.synced_from_soda_at)}`);
+  } else if (library.generated_at) {
+    parts.push(`本地库 ${formatDateTime(library.generated_at)}`);
+  } else {
+    parts.push("未同步汽水");
+  }
+  parts.push(library.overrides_updated_at ? "已载入人工标注" : "未添加人工标注");
+  if (library.sync?.ok) parts.push("刚刚刷新");
+  if (!state.serverMode) parts.push("静态模式");
+  els.libraryMeta.textContent = parts.join(" · ");
 }
 
 async function api(path, options = {}) {
@@ -284,6 +313,7 @@ function localLibrary() {
   return {
     source: draft.source,
     generated_at: draft.generated_at,
+    synced_from_soda_at: draft.synced_from_soda_at || draft.generated_at || "",
     overrides_updated_at: overrides.updated_at || "",
     count: rows.length,
     rows,
@@ -824,16 +854,43 @@ function setupTagFilterState() {
 
 async function refreshLibraryFromStorage() {
   const library = state.serverMode ? await api("/api/library") : localLibrary();
+  applyLibrary(library);
+}
+
+function applyLibrary(library) {
   state.tracks = library.rows;
-  const modeText = state.serverMode ? "" : " · 静态模式";
-  els.libraryMeta.textContent = `${library.count} 首 · ${
-    library.overrides_updated_at ? "已载入人工标注" : "未添加人工标注"
-  }${modeText}`;
+  updateLibraryMeta(library);
   setupFilters(library);
   if (!state.tracks.some((track) => track.track_id === state.selectedId)) {
     state.selectedId = state.tracks[0]?.track_id || "";
   }
   render();
+}
+
+async function syncLibraryFromSoda() {
+  if (!state.serverMode) {
+    toast("请使用本地服务模式同步汽水列表");
+    return;
+  }
+  if (state.syncing) return;
+
+  state.syncing = true;
+  els.syncLibraryButton.disabled = true;
+  els.syncLibraryButton.textContent = "同步中";
+  els.libraryMeta.textContent = "正在从汽水音乐同步抖音收藏";
+  try {
+    await flushPending();
+    const library = await api("/api/sync-library", { method: "POST", body: "{}" });
+    applyLibrary(library);
+    toast(`已同步 ${library.count} 首`);
+  } catch (error) {
+    toast(error.message || "同步失败");
+    await refreshLibraryFromStorage();
+  } finally {
+    state.syncing = false;
+    els.syncLibraryButton.disabled = false;
+    els.syncLibraryButton.textContent = "同步汽水";
+  }
 }
 
 async function load() {
@@ -845,15 +902,13 @@ async function load() {
     library = localLibrary();
     state.serverMode = false;
   }
-  state.tracks = library.rows;
-  const modeText = state.serverMode ? "" : " · 静态模式";
-  els.libraryMeta.textContent = `${library.count} 首 · ${library.overrides_updated_at ? "已载入人工标注" : "未添加人工标注"}${modeText}`;
-  setupFilters(library);
   bindGlobalEvents();
-  render();
+  applyLibrary(library);
 }
 
 function bindGlobalEvents() {
+  els.syncLibraryButton.addEventListener("click", syncLibraryFromSoda);
+
   els.searchInput.addEventListener("input", (event) => {
     state.filters.search = event.target.value;
     render();
