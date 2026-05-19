@@ -882,7 +882,8 @@ async function syncLibraryFromSoda() {
     await flushPending();
     const library = await api("/api/sync-library", { method: "POST", body: "{}" });
     applyLibrary(library);
-    toast(`已同步 ${library.count} 首`);
+    const skipped = Number(library.sync?.skipped_ugc_clip_count || 0);
+    toast(skipped ? `已同步 ${library.count} 首，跳过 ${skipped} 条原声` : `已同步 ${library.count} 首`);
   } catch (error) {
     toast(error.message || "同步失败");
     await refreshLibraryFromStorage();
