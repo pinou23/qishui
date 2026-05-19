@@ -383,17 +383,13 @@ async function fetchSodaDouyinFavorites() {
     await delay(sodaPlaylistPageDelayMs);
   }
 
-  let sourceOrder = 0;
-  const allRows = pages.flatMap((page) =>
+  let order = 0;
+  const rows = pages.flatMap((page) =>
     (page.media_resources || []).map((media) => {
-      sourceOrder += 1;
-      return normalizeSodaMedia(media, sourceOrder);
+      order += 1;
+      return normalizeSodaMedia(media, order);
     }),
   );
-  const skippedUgcClipCount = allRows.filter((row) => row.media_type === "ugc_clip").length;
-  const rows = allRows
-    .filter((row) => row.media_type !== "ugc_clip")
-    .map((row, index) => ({ ...row, order: index + 1 }));
 
   return {
     playlist: {
@@ -404,8 +400,6 @@ async function fetchSodaDouyinFavorites() {
     },
     exported_at: new Date().toISOString(),
     pages: pages.length,
-    raw_count: allRows.length,
-    skipped_ugc_clip_count: skippedUgcClipCount,
     count: rows.length,
     rows,
   };
@@ -619,8 +613,6 @@ async function syncLibraryFromSoda() {
       playlist_id: source.playlist.id,
       playlist_title: source.playlist.title,
       pages: source.pages,
-      raw_count: source.raw_count,
-      skipped_ugc_clip_count: source.skipped_ugc_clip_count,
       count: source.count,
       synced_at: draft.generated_at,
     };
