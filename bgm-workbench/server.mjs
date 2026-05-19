@@ -32,7 +32,7 @@ const playbackSessionTtlMs = 10 * 60 * 1000;
 const playbackLinkMinTtlMs = 60_000;
 const playbackLinkDefaultTtlMs = 10 * 60 * 1000;
 const playbackLinkMaxTtlMs = 45 * 60 * 1000;
-let playbackCacheIndex = { loadedAt: 0, trackToFile: new Map() };
+let playbackCacheIndex = { loadedAt: 0, trackToFile: new Map(), trackToCache: new Map() };
 const playbackSessions = new Map();
 const playbackLinkCache = new Map();
 let librarySyncInFlight = null;
@@ -149,9 +149,12 @@ function mergedLibrary() {
 function libraryPayload(sync = null) {
   const library = mergedLibrary();
   const cachedIds = new Set(loadPlaybackCacheIndex().keys());
+  const cacheDetails = loadPlaybackCacheDetails();
   const rows = library.rows.map((row) => ({
     ...row,
     playback_cached: cachedIds.has(row.track_id),
+    playback_cache_encrypted: Boolean(cacheDetails.get(row.track_id)?.encrypted),
+    playback_cache_any: cacheDetails.has(row.track_id),
   }));
   return {
     ...library,
@@ -639,13 +642,16 @@ async function syncLibraryWithFallback() {
 }
 
 function parseSodaCacheIndex() {
-  if (!fs.existsSync(sodaEntriesDbPath)) return new Map();
+  if (!fs.existsSync(sodaEntriesDbPath)) {
+    return { trackToFile: new Map(), trackToCache: new Map() };
+  }
   const lines = execFileSync("strings", ["-n", "8", sodaEntriesDbPath], {
     encoding: "utf8",
     maxBuffer: 25 * 1024 * 1024,
     stdio: ["ignore", "pipe", "ignore"],
   }).split(/\n/);
   const trackToFile = new Map();
+  const trackToCache = new Map();
   let currentFile = "";
   let currentLines = [];
 
@@ -653,12 +659,20 @@ function parseSodaCacheIndex() {
     if (!currentFile || !currentLines.length) return;
     const filePath = path.join(sodaCacheDir, currentFile);
     if (!fs.existsSync(filePath)) return;
-    if (!isPlayableAudioFile(filePath)) return;
     const text = currentLines.join("\n");
     const preferred = text.match(/track-(\d{10,})/);
     const fallback = text.match(/\b(\d{16,})\b/);
     const trackId = preferred?.[1] || fallback?.[1] || "";
-    if (trackId && !trackToFile.has(trackId)) trackToFile.set(trackId, filePath);
+    if (!trackId) return;
+
+    const cacheInfo = inspectAudioCacheFile(filePath);
+    const old = trackToCache.get(trackId);
+    if (!old || (!old.playable && cacheInfo.playable)) {
+      trackToCache.set(trackId, { ...cacheInfo, filePath });
+    }
+    if (cacheInfo.playable && !trackToFile.has(trackId)) {
+      trackToFile.set(trackId, filePath);
+    }
   };
 
   for (const line of lines) {
@@ -672,7 +686,7 @@ function parseSodaCacheIndex() {
     if (currentFile) currentLines.push(line);
   }
   flush();
-  return trackToFile;
+  return { trackToFile, trackToCache };
 }
 
 function isPlayableAudioFile(filePath) {
@@ -687,20 +701,50 @@ function isPlayableAudioFile(filePath) {
   }
 }
 
+function isEncryptedAudioCacheFile(filePath) {
+  try {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const stat = fs.fstatSync(fd);
+      const buffer = Buffer.alloc(Math.min(stat.size, 64 * 1024));
+      fs.readSync(fd, buffer, 0, buffer.length, 0);
+      return ["enca", "cenc", "senc", "tenc"].some((marker) =>
+        buffer.includes(Buffer.from(marker, "ascii")),
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
+function inspectAudioCacheFile(filePath) {
+  const stat = fs.statSync(filePath);
+  const playable = isPlayableAudioFile(filePath);
+  return {
+    playable,
+    encrypted: !playable && isEncryptedAudioCacheFile(filePath),
+    size: stat.size,
+  };
+}
+
 function loadPlaybackCacheIndex(force = false) {
   const now = Date.now();
   if (!force && now - playbackCacheIndex.loadedAt < cacheIndexTtlMs) {
     return playbackCacheIndex.trackToFile;
   }
   try {
-    playbackCacheIndex = {
-      loadedAt: now,
-      trackToFile: parseSodaCacheIndex(),
-    };
+    playbackCacheIndex = { loadedAt: now, ...parseSodaCacheIndex() };
   } catch {
-    playbackCacheIndex = { loadedAt: now, trackToFile: new Map() };
+    playbackCacheIndex = { loadedAt: now, trackToFile: new Map(), trackToCache: new Map() };
   }
   return playbackCacheIndex.trackToFile;
+}
+
+function loadPlaybackCacheDetails(force = false) {
+  loadPlaybackCacheIndex(force);
+  return playbackCacheIndex.trackToCache;
 }
 
 function cachedPlaybackForTrack(trackId) {
@@ -712,6 +756,15 @@ function cachedPlaybackForTrack(trackId) {
   if (!normalized.startsWith(sodaCacheDir) || !fs.existsSync(normalized)) return null;
   if (!isPlayableAudioFile(normalized)) return null;
   return normalized;
+}
+
+function cacheDetailsForTrack(trackId) {
+  if (!findTrack(trackId)) return null;
+  const details = loadPlaybackCacheDetails().get(trackId);
+  if (!details) return null;
+  const normalized = path.normalize(details.filePath);
+  if (!normalized.startsWith(sodaCacheDir) || !fs.existsSync(normalized)) return null;
+  return { ...details, filePath: normalized };
 }
 
 function readSodaCookieHeader() {
@@ -910,6 +963,7 @@ async function playbackForTrack(trackId) {
   if (!track) return { status: 404, body: { ok: false, error: "曲库中没有这首歌" } };
 
   const cachedFile = cachedPlaybackForTrack(trackId);
+  const cacheDetails = cacheDetailsForTrack(trackId);
   const cachedAudioUrl = `/api/playback/${encodeURIComponent(trackId)}/audio`;
   try {
     const online = await onlinePlaybackForTrack(track);
@@ -960,10 +1014,15 @@ async function playbackForTrack(trackId) {
         track_id: trackId,
         online: true,
         encrypted: true,
+        cached: Boolean(cacheDetails),
+        cache_encrypted: Boolean(cacheDetails?.encrypted),
         playable: false,
-        error: online.link_cache_hit
-          ? "这首歌之前已识别为汽水加密流；普通网页播放器不能直接播放"
-          : "已获取在线播放链路，但这首是汽水加密流；普通网页播放器不能直接播放",
+        error: cacheDetails?.encrypted
+          ? "汽水本地有缓存，但这个缓存是 CENC 加密 M4A；汽水 App 能解密，普通网页播放器不能直接播放"
+          : online.link_cache_hit
+            ? "这首歌之前已识别为汽水加密流；普通网页播放器不能直接播放"
+            : "已获取在线播放链路，但这首是汽水加密流；普通网页播放器不能直接播放",
+        cache_size: cacheDetails?.size || 0,
         link_cache_hit: online.link_cache_hit,
         link_expires_at: online.link_expires_at,
         qualities: online.qualities,
@@ -994,8 +1053,12 @@ async function playbackForTrack(trackId) {
         ok: false,
         track_id: trackId,
         online: false,
+        cached: Boolean(cacheDetails),
+        cache_encrypted: Boolean(cacheDetails?.encrypted),
         playable: false,
-        error: `在线播放链路获取失败：${error.message}`,
+        error: cacheDetails?.encrypted
+          ? `在线播放链路获取失败；汽水本地缓存存在但已加密，网页不能直接播放：${error.message}`
+          : `在线播放链路获取失败：${error.message}`,
       },
     };
   }

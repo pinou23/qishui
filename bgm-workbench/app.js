@@ -452,6 +452,9 @@ function trackBadges(track) {
     badges.push(`<span class="badge teal">${tag}</span>`);
   }
   if (track.playback_cached) badges.push(`<span class="badge green">有缓存</span>`);
+  if (!track.playback_cached && track.playback_cache_encrypted) {
+    badges.push(`<span class="badge amber">加密缓存</span>`);
+  }
   return badges.join("");
 }
 
